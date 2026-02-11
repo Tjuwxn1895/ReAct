@@ -74,6 +74,26 @@ def calculate(what):
 
 # 2.2 天气查询工具（使用 Open-Meteo 免费 API，无需 key）
 import requests
+import time
+
+def _get_json(url, params=None, timeout=(5, 25), retries=2, backoff=0.6):
+    """
+    简单的 GET + JSON + 重试封装。
+    :param timeout: (connect_timeout, read_timeout)
+    """
+    last_err = None
+    headers = {"User-Agent": "ReAct-WeatherTool/1.0"}
+    for i in range(retries + 1):
+        try:
+            resp = requests.get(url, params=params, timeout=timeout, headers=headers)
+            resp.raise_for_status()
+            return resp.json()
+        except (requests.exceptions.RequestException, ValueError) as e:
+            last_err = e
+            if i < retries:
+                time.sleep(backoff * (2 ** i))
+                continue
+            raise last_err
 
 def get_weather(location):
     """
@@ -81,37 +101,78 @@ def get_weather(location):
     :param location: 城市名或地名，如 "北京"、"上海"、"Tokyo"
     :return: 天气信息 dict，失败时含 error 键
     """
+    location = (location or "").strip()
+    if not location:
+        return {"error": "location 不能为空"}
+
+    # 先尝试 Open-Meteo（更结构化）
     try:
-        # 1. 根据地名获取经纬度
-        geo_url = "https://geocoding-api.open-meteo.com/v1/search"
-        geo_params = {"name": location, "count": 1, "language": "zh"}
-        geo_resp = requests.get(geo_url, params=geo_params, timeout=10)
-        geo_resp.raise_for_status()
-        geo_data = geo_resp.json()
-        results = geo_data.get("results") or []
-        if not results:
-            return {"error": f"未找到地点：{location}"}
-        lat = results[0]["latitude"]
-        lon = results[0]["longitude"]
-        name = results[0].get("name", location)
-        # 2. 获取天气
+        # 支持直接传入 "lat,lon" 来跳过地名解析
+        lat = lon = None
+        name = location
+        m = re.match(r"^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$", location)
+        if m:
+            lat, lon = float(m.group(1)), float(m.group(2))
+        else:
+            geo_url = "https://geocoding-api.open-meteo.com/v1/search"
+            geo_params = {"name": location, "count": 1, "language": "zh"}
+            geo_data = _get_json(geo_url, params=geo_params, timeout=(5, 25), retries=2)
+            results = geo_data.get("results") or []
+            if not results:
+                raise ValueError(f"未找到地点：{location}")
+            lat = results[0]["latitude"]
+            lon = results[0]["longitude"]
+            name = results[0].get("name", location)
+
         weather_url = "https://api.open-meteo.com/v1/forecast"
         weather_params = {
             "latitude": lat,
             "longitude": lon,
             "current": "temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m",
         }
-        weather_resp = requests.get(weather_url, params=weather_params, timeout=10)
-        weather_resp.raise_for_status()
-        w = weather_resp.json().get("current", {})
+        weather_data = _get_json(weather_url, params=weather_params, timeout=(5, 25), retries=2)
+        w = (weather_data or {}).get("current", {}) or {}
         summary = (
             f"{name}：当前气温 {w.get('temperature_2m', '—')}°C，"
             f"湿度 {w.get('relative_humidity_2m', '—')}%，"
             f"风速 {w.get('wind_speed_10m', '—')} km/h"
         )
-        return {"summary": summary, "location": name, "temperature": w.get("temperature_2m"), "humidity": w.get("relative_humidity_2m")}
-    except requests.exceptions.RequestException as e:
-        return {"error": f"请求失败：{e}"}
+        return {
+            "provider": "open-meteo",
+            "summary": summary,
+            "location": name,
+            "temperature": w.get("temperature_2m"),
+            "humidity": w.get("relative_humidity_2m"),
+            "wind_speed_kmh": w.get("wind_speed_10m"),
+        }
+    except Exception as e:
+        open_meteo_err = str(e)
+
+    # Open-Meteo 失败则降级到 wttr.in（通常在受限网络更容易通）
+    try:
+        wttr_url = f"https://wttr.in/{location}"
+        wttr_params = {"format": "j1", "lang": "zh"}
+        data = _get_json(wttr_url, params=wttr_params, timeout=(5, 25), retries=2)
+        cur = ((data or {}).get("current_condition") or [{}])[0] or {}
+        desc = (((cur.get("weatherDesc") or [{}])[0]) or {}).get("value")
+        summary = (
+            f"{location}：当前气温 {cur.get('temp_C', '—')}°C，"
+            f"湿度 {cur.get('humidity', '—')}%，"
+            f"风速 {cur.get('windspeedKmph', '—')} km/h"
+            + (f"，天气 {desc}" if desc else "")
+        )
+        return {
+            "provider": "wttr.in",
+            "summary": summary,
+            "location": location,
+            "temperature": float(cur["temp_C"]) if "temp_C" in cur and str(cur["temp_C"]).strip() != "" else None,
+            "humidity": int(cur["humidity"]) if "humidity" in cur and str(cur["humidity"]).strip() != "" else None,
+            "wind_speed_kmh": float(cur["windspeedKmph"]) if "windspeedKmph" in cur and str(cur["windspeedKmph"]).strip() != "" else None,
+            "desc": desc,
+            "open_meteo_error": open_meteo_err,
+        }
+    except Exception as e:
+        return {"error": f"天气查询失败（open-meteo: {open_meteo_err}；wttr.in: {e}）"}
 print(get_weather("北京"))
 
 # 2.3 代码生成工具：根据编程语言和需求描述，调用 LLM 生成代码
@@ -249,3 +310,34 @@ known_actions = {
     "save_code_to_file": save_code_to_file,
     "generate_and_save_code": generate_and_save_code
 }
+
+# 4.ReAct 循环
+action_re = re.compile('^Action: (\w+): (.*)$') #正则表达式定义（识别 Action 行）
+def query(question, max_turns=5): # max_turns 是最多允许模型推理的轮数，用于避免死循环
+    i = 0
+    bot = Agent(prompt) #初始化 Agent 并设置提示词
+    next_prompt = question #初始提示词
+    while i < max_turns:
+        i+=1
+        res=bot.run(next_prompt)
+        print(res)
+        actions = [
+            action_re.match(a) 
+            for a in res.split('\n') 
+            if action_re.match(a) #action_re.match(a) 匹配 Action 行
+        ]
+        if actions: #如果存在 Action 行
+            # There is an action to run
+            action, action_input = actions[0].groups()
+            if action not in known_actions:
+                raise Exception("Unknown action: {}: {}".format(action, action_input))
+            print(" -- running {} {}".format(action, action_input))
+            observation = known_actions[action](action_input)
+            print("Observation:", observation)
+            next_prompt = "Observation: {}".format(observation)
+        else:
+            return res #如果不存在 Action 行，则返回结果
+            
+question = """I have 2 dogs, a border collie and a scottish terrier. \
+What is their combined weight"""
+query(question)
