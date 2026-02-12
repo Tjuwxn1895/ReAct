@@ -84,6 +84,10 @@ TOOLS_DESCRIPTION = """
 - generate_and_save_code(language, description)：生成代码并直接保存到文件。
   格式：Action: generate_and_save_code: 编程语言, 需求描述
   例：Action: generate_and_save_code: python, 写一个斐波那契函数
+
+- search_web(query)：在网页上搜索关键词或问题，用于查询人物、事件、事实等。
+  格式：Action: search_web: 搜索关键词或问句
+  例：Action: search_web: 天津大学 魏建国
 """.strip()
 
 prompt = """
@@ -114,6 +118,9 @@ Answer: A bulldog weights 51 lbs
 
 Weather example:
 Action: get_weather: 天津
+
+When the user asks about a person, place, or fact (e.g. "介绍某人"), use search_web first:
+Action: search_web: 天津大学 魏建国
 """.strip()
 
 # 2.工具准备
@@ -552,7 +559,48 @@ def generate_and_save_code(language, description, base_dir="generated_code_user"
 # r = generate_and_save_code("C++", "写一个C++程序，计算斐波那契数列第 n 项")
 # print(r.get("saved_path"), r.get("code", "")[:200])
 
-# 2.4 查询列表小狗体重
+# 2.4 网页搜索（DuckDuckGo 即时答案 + HTML 结果摘要）
+def search_web(query):
+    """用 DuckDuckGo 做网页搜索，返回摘要文本供模型使用。"""
+    q = (query or "").strip()
+    if not q:
+        return "请提供搜索关键词。"
+    headers = {"User-Agent": "ReAct-SearchTool/1.0 (compatible; +https://github.com)"}
+    # 先尝试即时答案 API（适合人物、定义类）
+    try:
+        r = requests.get(
+            "https://api.duckduckgo.com/",
+            params={"q": q, "format": "json"},
+            headers=headers,
+            timeout=8,
+        )
+        r.raise_for_status()
+        data = r.json()
+        abstract = (data.get("AbstractText") or "").strip()
+        if abstract:
+            title = (data.get("Heading") or data.get("AbstractSource") or "结果").strip()
+            return "{}: {}".format(title, abstract)
+        # 无即时答案时用 HTML 搜索抓取摘要
+        r2 = requests.get(
+            "https://html.duckduckgo.com/html/",
+            params={"q": q},
+            headers=headers,
+            timeout=10,
+        )
+        r2.raise_for_status()
+        text = r2.text
+        # 简单提取 result__snippet 内容（最多前 3 条）
+        import re as _re
+        snippets = _re.findall(r'class="result__snippet"[^>]*>([^<]+)', text)
+        snippets = [s.replace("&nbsp;", " ").strip() for s in snippets[:3] if s.strip()]
+        if snippets:
+            return "搜索摘要：\n" + "\n".join("- " + s for s in snippets)
+    except Exception as e:
+        return "搜索失败: {}".format(e)
+    return "未找到与「{}」相关的摘要。".format(q)
+
+
+# 2.5 查询列表小狗体重
 def average_dog_weight(name):
     if name in "Scottish Terrier": 
         return("Scottish Terriers average 20 lbs")
@@ -593,6 +641,7 @@ known_actions = {
     "average_dog_weight": average_dog_weight,
     "get_weather": get_weather,
     "weather_search": get_weather,  # 别名：模型有时会输出 weather_search
+    "search_web": search_web,
     "generate_code": _generate_code_single,
     "save_code_to_file": _save_code_to_file_single,
     "generate_and_save_code": _generate_and_save_code_single,
@@ -629,6 +678,10 @@ def query(question, max_turns=5): # max_turns 是最多允许模型推理的轮�
             return res #如果不存在 Action 行，则返回结果
 
 if __name__ == "__main__":
-    print("请输入问题：")
-    question = input()
-    query(question)
+    while True:
+        print("请输入问题（直接回车或输入 退出 结束）：")
+        question = input().strip()
+        if not question or question in ("退出", "exit", "quit"):
+            break
+        query(question)
+        #print("\n请输入下一个问题（直接回车或输入 退出 结束）：")
