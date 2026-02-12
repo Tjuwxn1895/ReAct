@@ -1,7 +1,19 @@
 import re
 import os
+import sys
 from datetime import datetime
 from openai import OpenAI
+
+
+def safe_input():
+    """从 stdin 读一行，兼容 UTF-8 与 GBK 等终端编码，避免 UnicodeDecodeError。"""
+    raw = sys.stdin.buffer.readline()
+    for enc in ("utf-8", "gbk", "gb2312", "latin-1"):
+        try:
+            return raw.decode(enc).rstrip("\r\n")
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace").rstrip("\r\n")
 
 client = OpenAI(
     api_key="sk-6e09b2f6b8d143b1ad6ea1299913583e",
@@ -38,15 +50,45 @@ abot=Agent()
 res=abot.run("请为我介绍一下currency-ai的最新研究成果")
 print(res)
 """
-# 3.提示词模板
+# 3.提示词模板（所有可用工具说明）
+# 注意：下方 prompt 在 query() 中通过 Agent(prompt) 传入，实际进入 Agent.__init__(system=prompt)，
+# 即作为 system 参数 → 赋给 self.system → 在 __init__ 里调用 add_message("system", self.system)，
+# 从而作为「系统消息」写入 self.messages，并在每次 get_response() 时随 messages 发给 API。
+TOOLS_DESCRIPTION = """
+- calculate(what)：计算数学表达式。格式：Action: calculate: 表达式
+  例：Action: calculate: 3+5*2
+
+- average_dog_weight(name)：查询某品种狗的平均体重（如 Bulldog, Scottish Terrier, Border Collie, Toy Poodle）。
+  格式：Action: average_dog_weight: 品种名
+  例：Action: average_dog_weight: Bulldog
+
+- get_weather(location) 或 weather_search(location)：查询某城市/地点的当前天气。
+  格式：Action: get_weather: 城市或地名
+  例：Action: get_weather: 天津
+
+- generate_code(language, description)：根据编程语言和需求描述生成代码。
+  格式：Action: generate_code: 编程语言, 需求描述（用英文逗号+空格分隔）
+  例：Action: generate_code: python, 写一个快速排序
+
+- save_code_to_file(code, language, description)：将已有代码保存到文件。
+  格式：Action: save_code_to_file: 编程语言, 需求描述, 代码内容（代码中若有逗号可用分号;分隔前三项）
+  例：先 generate_code 得到代码，再调用本工具保存。
+
+- generate_and_save_code(language, description)：生成代码并直接保存到文件。
+  格式：Action: generate_and_save_code: 编程语言, 需求描述
+  例：Action: generate_and_save_code: python, 写一个斐波那契函数
+""".strip()
+
 prompt = """
 You run in a loop of Thought, Action, PAUSE, Observation.
-At the end of the loop you output an Answer
+At the end of the loop you output an Answer.
 Use Thought to describe your thoughts about the question you have been asked.
 Use Action to run one of the actions available to you - then return PAUSE.
 Observation will be the result of running those actions.
-Your available actions are:
-{known_actions}
+
+Your available actions (use exactly these names):
+
+""" + TOOLS_DESCRIPTION + """
 
 Example session:
 
@@ -62,6 +104,9 @@ Observation: A Bulldog weights 51 lbs
 You then output:
 
 Answer: A bulldog weights 51 lbs
+
+Weather example:
+Action: get_weather: 天津
 """.strip()
 
 # 2.工具准备
@@ -173,7 +218,7 @@ def get_weather(location):
         }
     except Exception as e:
         return {"error": f"天气查询失败（open-meteo: {open_meteo_err}；wttr.in: {e}）"}
-print(get_weather("北京"))
+#print(get_weather("北京"))
 
 # 2.3 代码生成工具：根据编程语言和需求描述，调用 LLM 生成代码
 def generate_code(language, description):
@@ -188,15 +233,30 @@ def generate_code(language, description):
             messages=[
                 {
                     "role": "system",
-                    "content": "你是一个代码生成助手。根据用户给出的编程语言和需求描述，只输出可运行的代码，不要用 markdown 代码块包裹，不要多余解释。若需要多行，直接输出代码本身。"
+                    "content": "你是一个代码生成助手。根据用户给出的编程语言和需求描述，只输出可运行的完整代码。要求：1）不要用 markdown 代码块（不要用 ``` 包裹）；2）不要任何解释说明；3）必须输出从第一行到最后一行的全部代码，不能只写头文件或开头几行就结束。"
                 },
                 {
                     "role": "user",
                     "content": f"编程语言：{language}\n需求描述：{description}"
                 }
-            ]
+            ],
+            max_tokens=8192,
+            temperature=0.2,
         )
-        return response.choices[0].message.content.strip()
+        code = response.choices[0].message.content.strip()
+        # 若返回过短（疑似被截断），尝试再请求一次
+        if len(code) < 150 and ("include" in code or "import" in code):
+            response2 = client.chat.completions.create(
+                model="deepseek-chat",
+                messages=[
+                    {"role": "system", "content": "你只输出完整可运行代码，不要 markdown 包裹，不要解释，必须输出全部代码不能省略。"},
+                    {"role": "user", "content": f"编程语言：{language}\n需求：{description}\n请输出完整代码，不要只写头文件或前几行。"},
+                ],
+                max_tokens=8192,
+                temperature=0.2,
+            )
+            code = response2.choices[0].message.content.strip()
+        return code
     except Exception as e:
         return {"error": str(e), "language": language, "description": description}
 
@@ -292,6 +352,7 @@ def generate_and_save_code(language, description, base_dir="generated_code"):
 # r = generate_and_save_code("C++", "写一个C++程序，计算斐波那契数列第 n 项")
 # print(r.get("saved_path"), r.get("code", "")[:200])
 
+# 2.4 查询列表小狗体重
 def average_dog_weight(name):
     if name in "Scottish Terrier": 
         return("Scottish Terriers average 20 lbs")
@@ -302,20 +363,49 @@ def average_dog_weight(name):
     else:
         return("An average dog weights 50 lbs")
 
+
+# 2.5 供 ReAct 单字符串调用的包装（Action 行只支持「名称: 一个字符串」）
+def _generate_code_single(s):
+    s = (s or "").strip()
+    idx = s.find(", ")
+    if idx >= 0:
+        return generate_code(s[:idx].strip(), s[idx + 2 :].strip())
+    return generate_code(s, "")
+
+
+def _generate_and_save_code_single(s):
+    s = (s or "").strip()
+    idx = s.find(", ")
+    if idx >= 0:
+        return generate_and_save_code(s[:idx].strip(), s[idx + 2 :].strip())
+    return generate_and_save_code(s, "")
+
+
+def _save_code_to_file_single(s):
+    parts = (s or "").split(", ", 2)
+    if len(parts) < 3:
+        return save_code_to_file("", parts[0] if parts else "python", parts[1] if len(parts) > 1 else "")
+    return save_code_to_file(parts[2].strip(), parts[0].strip(), parts[1].strip())
+
+
 known_actions = {
     "calculate": calculate,
     "average_dog_weight": average_dog_weight,
     "get_weather": get_weather,
-    "generate_code": generate_code,
-    "save_code_to_file": save_code_to_file,
-    "generate_and_save_code": generate_and_save_code
+    "weather_search": get_weather,  # 别名：模型有时会输出 weather_search
+    "generate_code": _generate_code_single,
+    "save_code_to_file": _save_code_to_file_single,
+    "generate_and_save_code": _generate_and_save_code_single,
 }
 
 # 4.ReAct 循环
 action_re = re.compile('^Action: (\w+): (.*)$') #正则表达式定义（识别 Action 行）
 def query(question, max_turns=5): # max_turns 是最多允许模型推理的轮数，用于避免死循环
     i = 0
-    bot = Agent(prompt) #初始化 Agent 并设置提示词
+    # prompt 作为第一个参数传入 Agent，即 Agent.__init__(self, system=prompt)；
+    # 在 __init__ 内赋给 self.system，并执行 add_message("system", self.system)，
+    # 因此 prompt 作为「系统消息」加入 self.messages，在 get_response() 时随 messages 发给 API。
+    bot = Agent(prompt)
     next_prompt = question #初始提示词
     while i < max_turns:
         i+=1
@@ -328,16 +418,16 @@ def query(question, max_turns=5): # max_turns 是最多允许模型推理的轮�
         ]
         if actions: #如果存在 Action 行
             # There is an action to run
-            action, action_input = actions[0].groups()
-            if action not in known_actions:
+            action, action_input = actions[0].groups() # 如果 actions 列表非空，则获取 Action 名称和 Action 输入的参数
+            if action not in known_actions: # 如果 Action 名称不在 known_actions 列表中，则抛出异常
                 raise Exception("Unknown action: {}: {}".format(action, action_input))
-            print(" -- running {} {}".format(action, action_input))
-            observation = known_actions[action](action_input)
-            print("Observation:", observation)
-            next_prompt = "Observation: {}".format(observation)
+            print(" -- running {} {}".format(action, action_input)) # 打印正在运行的 Action 名称和 Action 输入的参数
+            observation = known_actions[action](action_input) # 调用 Action 函数，并获取返回值
+            print("Observation:", observation) # 打印 Observation 返回值
+            next_prompt = "Observation: {}".format(observation) #将 Observation 返回模型,作为下一轮对话的内容
         else:
             return res #如果不存在 Action 行，则返回结果
-            
-question = """I have 2 dogs, a border collie and a scottish terrier. \
-What is their combined weight"""
+
+print("请输入问题：")
+question = safe_input()
 query(question)
