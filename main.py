@@ -2,23 +2,28 @@ import re
 import os
 import sys
 from datetime import datetime
-from openai import OpenAI
+try:
+    from openai import OpenAI  # pyright: ignore[reportMissingImports]
+except ImportError:  # 允许只用保存工具，不强依赖 openai 包
+    OpenAI = None
 
 
-def safe_input():
-    """从 stdin 读一行，兼容 UTF-8 与 GBK 等终端编码，避免 UnicodeDecodeError。"""
-    raw = sys.stdin.buffer.readline()
-    for enc in ("utf-8", "gbk", "gb2312", "latin-1"):
-        try:
-            return raw.decode(enc).rstrip("\r\n")
-        except UnicodeDecodeError:
-            continue
-    return raw.decode("utf-8", errors="replace").rstrip("\r\n")
+# def safe_input():
+#     """从 stdin 读一行，兼容 UTF-8 与 GBK 等终端编码，避免 UnicodeDecodeError。"""
+#     raw = sys.stdin.buffer.readline()
+#     for enc in ("utf-8", "gbk", "gb2312", "latin-1"):
+#         try:
+#             return raw.decode(enc).rstrip("\r\n")
+#         except UnicodeDecodeError:
+#             continue
+#     return raw.decode("utf-8", errors="replace").rstrip("\r\n")
 
-client = OpenAI(
-    api_key="sk-6e09b2f6b8d143b1ad6ea1299913583e",
-    base_url="https://api.deepseek.com/v1"
-)
+client = None
+if OpenAI is not None:
+    client = OpenAI(
+        api_key="sk-6e09b2f6b8d143b1ad6ea1299913583e",
+        base_url="https://api.deepseek.com/v1",
+    )
 
 # 1.构建一个支持 LLM 对话的类，用于与大语言模型进行交互，同时记录完整的对话信息
 class Agent:
@@ -33,6 +38,8 @@ class Agent:
         return self.messages
 
     def get_response(self):
+        if client is None:
+            raise RuntimeError("缺少依赖：请先安装 openai 包（pip install openai），否则无法调用大模型。")
         response = client.chat.completions.create(
             model="deepseek-chat",
             messages=self.messages
@@ -227,36 +234,59 @@ def generate_code(language, description):
     :param description: 需求描述，如 "写一个快速排序"、"读取 CSV 并求平均值"
     :return: 生成的代码字符串，若失败返回包含 error 的 dict
     """
+    if client is None:
+        return {
+            "error": "缺少依赖：请先安装 openai 包（pip install openai），否则无法调用大模型。",
+            "language": language,
+            "description": description,
+        }
     try:
-        response = client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "你是一个代码生成助手。根据用户给出的编程语言和需求描述，只输出可运行的完整代码。要求：1）不要用 markdown 代码块（不要用 ``` 包裹）；2）不要任何解释说明；3）必须输出从第一行到最后一行的全部代码，不能只写头文件或开头几行就结束。"
-                },
-                {
-                    "role": "user",
-                    "content": f"编程语言：{language}\n需求描述：{description}"
-                }
-            ],
-            max_tokens=8192,
-            temperature=0.2,
+        base_system = (
+            "你是一个代码生成助手。根据用户给出的编程语言和需求描述，只输出可运行的完整代码。"
+            "要求：1）不要用 markdown 代码块（不要用 ``` 包裹）；2）不要任何解释说明；"
+            "3）必须输出从第一行到最后一行的全部代码，不能只写头文件或开头几行就结束。"
         )
-        code = response.choices[0].message.content.strip()
-        # 若返回过短（疑似被截断），尝试再请求一次
-        if len(code) < 150 and ("include" in code or "import" in code):
-            response2 = client.chat.completions.create(
+        base_user = f"编程语言：{language}\n需求描述：{description}"
+
+        last_code = ""
+        for attempt in range(3):
+            # 第一次用基础提示词；后续重试会加强约束，避免“只输出头文件/分段代码块”
+            if attempt == 0:
+                messages = [
+                    {"role": "system", "content": base_system},
+                    {"role": "user", "content": base_user},
+                ]
+            else:
+                messages = [
+                    {
+                        "role": "system",
+                        "content": base_system
+                        + "补充要求：必须输出单文件完整代码；不要把代码拆成多个代码块；"
+                        + "若语言为 C/C++/Java，必须包含可运行入口 main（C/C++: int main...；Java: public static void main...）。"
+                    },
+                    {
+                        "role": "user",
+                        "content": base_user
+                        + "\n注意：你上次输出不完整（疑似只有头文件/导入或缺少 main）。请这次一次性输出完整代码。",
+                    },
+                ]
+
+            response = client.chat.completions.create(
                 model="deepseek-chat",
-                messages=[
-                    {"role": "system", "content": "你只输出完整可运行代码，不要 markdown 包裹，不要解释，必须输出全部代码不能省略。"},
-                    {"role": "user", "content": f"编程语言：{language}\n需求：{description}\n请输出完整代码，不要只写头文件或前几行。"},
-                ],
+                messages=messages,
                 max_tokens=8192,
                 temperature=0.2,
             )
-            code = response2.choices[0].message.content.strip()
-        return code
+
+            raw = (response.choices[0].message.content or "").strip()
+            code = _strip_markdown_code_block(raw)
+            last_code = code
+
+            if not _code_seems_incomplete(code, language):
+                return code
+
+        # 多次重试仍不理想：至少返回最后一次的结果（保存时也会做一次代码块清理）
+        return last_code
     except Exception as e:
         return {"error": str(e), "language": language, "description": description}
 
@@ -295,20 +325,155 @@ def _language_to_filename(language):
 
 
 def _strip_markdown_code_block(text):
-    """去掉 LLM 可能返回的 ```lang ... ``` 包裹，只保留中间代码。"""
-    if not text or "```" not in text:
-        return text.strip()
-    # 匹配 ```lang 或 ``` 开头的块
-    m = re.search(r"^```[\w]*\s*\n?(.*?)```", text.strip(), re.DOTALL)
-    if m:
-        return m.group(1).strip()
-    # 只有开头 ``` 没有结尾
-    if text.strip().startswith("```"):
-        return re.sub(r"^```[\w]*\s*\n?", "", text.strip())
-    return text.strip()
+    """
+    去掉 LLM 可能返回的 ```lang ... ``` 包裹，只保留中间代码。
+
+    兼容以下情况：
+    - 返回被一个代码块包裹
+    - 返回被多个代码块分段包裹（旧实现会只取第一个块，导致只保存头文件）
+    - 返回前后夹杂说明文字（只提取代码块内容；若没有代码块则原样返回）
+    """
+    if not text:
+        return ""
+
+    s = str(text).strip()
+    if "```" not in s:
+        return s
+
+    # 提取所有 fenced code blocks，并拼接（优先保证完整代码不丢段）
+    # 允许 ```c / ```cpp / ```python / ``` 等多种语言标记
+    blocks = re.findall(r"```[^\n]*\n([\s\S]*?)```", s)
+    if blocks:
+        joined = "\n\n".join(b.strip() for b in blocks if b and b.strip())
+        return joined.strip() if joined.strip() else s
+
+    # 只有开头 ``` 没有结尾：去掉第一行 fence
+    if s.startswith("```"):
+        s2 = re.sub(r"^```[^\n]*\n?", "", s)
+        return s2.strip()
+
+    return s
 
 
-def save_code_to_file(code, language, description="", base_dir="generated_code"):
+def _normalize_language(language: str) -> str:
+    key = (language or "").strip().lower()
+    return _LANG_ALIASES.get(key, key)
+
+
+def _code_seems_incomplete(code: str, language: str) -> bool:
+    """
+    用非常轻量的启发式判断“像是只生成了头/导入”等不完整输出。
+    目的：触发一次更强提示的重试，避免落盘只有一行 #include。
+    """
+    c = (code or "").strip()
+    if not c:
+        return True
+
+    lang = _normalize_language(language)
+
+    # 典型“只有头文件/导入”的短输出
+    if len(c) < 120:
+        if re.search(r"^\s*#include\s+<", c, re.MULTILINE) and "main(" not in c:
+            return True
+        if re.search(r"^\s*import\s+", c, re.MULTILINE) and not re.search(r"\b(def|function|class)\b", c):
+            return True
+
+    # 对 C/C++/Java 更严格：要求存在 main
+    if lang in {"c", "cpp", "java"} and "main(" not in c:
+        # 有头文件/类但没有 main，基本不可直接运行
+        if re.search(r"^\s*#include\s+<", c, re.MULTILINE) or (lang == "java" and "class" in c):
+            return True
+
+    # 明显被截断：只有起始 fence 或末尾 fence
+    if c.count("```") == 1:
+        return True
+
+    return False
+
+
+def _auto_newline_code(code: str, language: str) -> str:
+    """
+    将“单行的长代码”做基础换行，便于编辑阅读。
+    注意：这是轻量级格式化，不追求完美排版，只保证可读性大幅提升且尽量不破坏语义。
+    """
+    if not code:
+        return ""
+    if "\n" in code:
+        return code
+
+    lang = _normalize_language(language)
+    if lang not in {"java", "c", "cpp", "cs", "javascript", "typescript", "php"}:
+        return code
+
+    s = code.strip()
+    if len(s) < 120:
+        return s
+
+    out = []
+    indent = 0
+    in_single = False
+    in_double = False
+    escape = False
+
+    def push_newline():
+        # 去掉行尾多余空格
+        while out and out[-1] == " ":
+            out.pop()
+        out.append("\n")
+        out.append(" " * (indent * 4))
+
+    for ch in s:
+        if escape:
+            out.append(ch)
+            escape = False
+            continue
+
+        if ch == "\\" and (in_single or in_double):
+            out.append(ch)
+            escape = True
+            continue
+
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            out.append(ch)
+            continue
+
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            out.append(ch)
+            continue
+
+        if in_single or in_double:
+            out.append(ch)
+            continue
+
+        if ch == "{":
+            out.append(ch)
+            indent += 1
+            push_newline()
+            continue
+
+        if ch == "}":
+            indent = max(0, indent - 1)
+            push_newline()
+            out.append(ch)
+            push_newline()
+            continue
+
+        if ch == ";":
+            out.append(ch)
+            push_newline()
+            continue
+
+        out.append(ch)
+
+    formatted = "".join(out)
+    # 压缩连续空行
+    formatted = re.sub(r"\n\s*\n\s*\n+", "\n\n", formatted).strip() + "\n"
+    return formatted
+
+
+def save_code_to_file(code, language, description="", base_dir="generated_code_user"):
     """
     将生成的代码保存到「base_dir/新建子文件夹/新建文件」中。
     :param code: 代码字符串
@@ -317,22 +482,57 @@ def save_code_to_file(code, language, description="", base_dir="generated_code")
     :param base_dir: 根目录，相对于当前工作目录
     :return: 保存后的绝对路径，失败时返回 None 或抛出异常
     """
+    # 选择一个可写的 base_dir：优先使用传入值，否则自动降级到项目目录/用户目录或 /tmp
+    #（避免 base_dir 目录被 root 创建导致 PermissionError）
+    import tempfile
+
+    project_root = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
+
+    def _to_abs_dir(p: str) -> str:
+        if not p:
+            return p
+        return p if os.path.isabs(p) else os.path.join(project_root, p)
+
+    candidates = []
+    if base_dir:
+        candidates.append(_to_abs_dir(base_dir))
+    # 若默认目录不可写，优先尝试项目内可写目录
+    candidates.append(_to_abs_dir("generated_code_user"))
+    candidates.append(os.path.join(os.path.expanduser("~"), "ReAct_generated_code"))
+    candidates.append(os.path.join(tempfile.gettempdir(), "ReAct_generated_code"))
+
+    chosen_base = None
+    for cand in candidates:
+        try:
+            os.makedirs(cand, exist_ok=True)
+            if os.access(cand, os.W_OK | os.X_OK):
+                chosen_base = cand
+                break
+        except PermissionError:
+            continue
+        except OSError:
+            continue
+
+    if not chosen_base:
+        raise PermissionError(f"没有可写的保存目录，候选目录均不可写：{candidates}")
+
     # 新建子文件夹名：时间戳 + 描述前 20 字（去掉非法字符）
     safe_desc = re.sub(r"[^\w\u4e00-\u9fff\-]", "_", description or "code")[:20]
     folder_name = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + (safe_desc or "code")
-    folder_path = os.path.join(base_dir, folder_name)
+    folder_path = os.path.join(chosen_base, folder_name)
     os.makedirs(folder_path, exist_ok=True)
     # 根据语言（含 C++、c# 等别名）决定后缀
     filename = _language_to_filename(language)
     file_path = os.path.join(folder_path, filename)
-    # 去掉可能被 LLM 包上的 ```lang ... ```
+    # 去掉可能被 LLM 包上的 ```lang ... ```，并对单行长代码做基础换行
     code = _strip_markdown_code_block(code)
+    code = _auto_newline_code(code, language)
     with open(file_path, "w", encoding="utf-8") as f:
         f.write(code)
     return os.path.abspath(file_path)
 
 
-def generate_and_save_code(language, description, base_dir="generated_code"):
+def generate_and_save_code(language, description, base_dir="generated_code_user"):
     """
     生成代码并保存到「base_dir/新建文件夹/新建文件」。
     :return: {"code": 代码, "saved_path": 保存的绝对路径}，失败时含 "error" 键
@@ -399,7 +599,7 @@ known_actions = {
 }
 
 # 4.ReAct 循环
-action_re = re.compile('^Action: (\w+): (.*)$') #正则表达式定义（识别 Action 行）
+action_re = re.compile(r"^Action: (\w+): (.*)$")  # 正则表达式定义（识别 Action 行）
 def query(question, max_turns=5): # max_turns 是最多允许模型推理的轮数，用于避免死循环
     i = 0
     # prompt 作为第一个参数传入 Agent，即 Agent.__init__(self, system=prompt)；
@@ -428,6 +628,7 @@ def query(question, max_turns=5): # max_turns 是最多允许模型推理的轮�
         else:
             return res #如果不存在 Action 行，则返回结果
 
-print("请输入问题：")
-question = safe_input()
-query(question)
+if __name__ == "__main__":
+    print("请输入问题：")
+    question = input()
+    query(question)
